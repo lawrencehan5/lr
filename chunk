@@ -1,0 +1,78 @@
+N_CHUNKS = 64  # fixed constant; do NOT derive from thread count. Keep >= max threads you use.
+
+
+@njit(parallel=True, cache=True)
+def _binary_gradient(features, residual, gradient, n_chunks):
+    partial = np.zeros((n_chunks, gradient.shape[0], gradient.shape[1]), dtype=np.float64)
+    for chunk in prange(n_chunks):
+        start = chunk * features.shape[0] // n_chunks
+        end = (chunk + 1) * features.shape[0] // n_chunks
+        for row in range(start, end):
+            for column in range(features.shape[1]):
+                if features[row, column]:
+                    for output in range(residual.shape[1]):
+                        partial[chunk, column, output] += residual[row, output]
+    for column in prange(gradient.shape[0]):
+        for output in range(gradient.shape[1]):
+            total = 0.0
+            for chunk in range(n_chunks):
+                total += partial[chunk, column, output]
+            gradient[column, output] = total
+
+
+@njit(parallel=True, cache=True)
+def _sparse_gradient(indptr, indices, values, residual, gradient, n_chunks):
+    partial = np.zeros((n_chunks, gradient.shape[0], gradient.shape[1]), dtype=np.float64)
+    for chunk in prange(n_chunks):
+        start = chunk * residual.shape[0] // n_chunks
+        end = (chunk + 1) * residual.shape[0] // n_chunks
+        for row in range(start, end):
+            for position in range(indptr[row], indptr[row + 1]):
+                for output in range(residual.shape[1]):
+                    partial[chunk, indices[position], output] += values[position] * residual[row, output]
+    for column in prange(gradient.shape[0]):
+        for output in range(gradient.shape[1]):
+            total = 0.0
+            for chunk in range(n_chunks):
+                total += partial[chunk, column, output]
+            gradient[column, output] = total
+
+
+@njit(parallel=True, cache=True)
+def _cpu_loss(logits, y, sample_weight, n_chunks):
+    partial = np.zeros(n_chunks, dtype=np.float64)
+    for chunk in prange(n_chunks):
+        start = chunk * logits.shape[0] // n_chunks
+        end = (chunk + 1) * logits.shape[0] // n_chunks
+        chunk_loss = 0.0
+        for row in range(start, end):
+            weight = 1.0 if sample_weight is None else sample_weight[row]
+            if logits.shape[1] == 1:
+                logit = np.float64(logits[row, 0])
+                target = np.float64(y[row])
+                exponential = math.exp(-abs(logit))
+                tail = exponential / (1.0 + exponential)
+                if logit >= 0:
+                    chunk_loss += weight * ((1.0 - target) * logit + math.log1p(exponential))
+                    logits[row, 0] = weight * ((1.0 - target) - tail)
+                else:
+                    chunk_loss += weight * (-target * logit + math.log1p(exponential))
+                    logits[row, 0] = weight * (tail - target)
+            else:
+                target = np.int64(y[row])
+                maximum = np.float64(logits[row, 0])
+                for output in range(1, logits.shape[1]):
+                    maximum = max(maximum, np.float64(logits[row, output]))
+                target_logit = np.float64(logits[row, target])
+                normalizer = 0.0
+                for output in range(logits.shape[1]):
+                    normalizer += math.exp(np.float64(logits[row, output]) - maximum)
+                chunk_loss += weight * (math.log(normalizer) + (maximum - target_logit))
+                for output in range(logits.shape[1]):
+                    probability = math.exp(np.float64(logits[row, output]) - maximum) / normalizer
+                    logits[row, output] = weight * (probability - (output == target))
+        partial[chunk] = chunk_loss
+    total = 0.0
+    for chunk in range(n_chunks):
+        total += partial[chunk]
+    return total
